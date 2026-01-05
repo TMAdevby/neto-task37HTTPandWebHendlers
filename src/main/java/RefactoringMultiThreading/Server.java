@@ -1,35 +1,29 @@
 package RefactoringMultiThreading;
 
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.LocalDateTime;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class Server {
 
-    private static final List<String> VALID_PATHS = List.of(
-            "/index.html", "/spring.svg", "/spring.png", "/resources.html",
-            "/styles.css", "/app.js", "/links.html", "/forms.html",
-            "/classic.html", "/events.html", "/events.js"
-    );
-
-    private static final int PORT = 8080;
+    private final Map<String, Map<String, Handler>> handlers = new ConcurrentHashMap<>();
     private static final int THREAD_POOL_SIZE = 64;
-    private static final String PUBLIC_DIR = "public";
-
     private final ExecutorService threadPool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
 
-    public void start() {
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            System.out.println("Сервер запущен на порту " + PORT);
+    public void addHandler(String method, String path, Handler handler) {
+        handlers.computeIfAbsent(method, k -> new ConcurrentHashMap<>())
+                .put(path, handler);
+    }
+
+    public void listen(int port) {
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            System.out.println("Сервер запущен на порту " + port);
             while (!Thread.currentThread().isInterrupted()) {
                 Socket socket = serverSocket.accept();
                 threadPool.submit(() -> handleRequest(socket));
@@ -43,87 +37,74 @@ public class Server {
 
     private void handleRequest(Socket socket) {
         try (socket;
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-             BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream())) {
+             var in = new BufferedInputStream(socket.getInputStream());
+             var out = new BufferedOutputStream(socket.getOutputStream())) {
 
-            String requestLine = in.readLine();
-            if (requestLine == null || requestLine.isEmpty()) {
-                return;
-            }
+            Request request = parseRequest(in);
+            Handler handler = findHandler(request.getMethod(), request.getPath());
 
-            String[] parts = requestLine.split(" ");
-            if (parts.length != 3) {
-                sendErrorResponse(out, 400, "Bad Request");
-                return;
-            }
-
-            // Заголовок
-            String path = parts[1];
-            if (!VALID_PATHS.contains(path)) {
+            if (handler != null) {
+                handler.handle(request, out);
+            } else {
                 sendErrorResponse(out, 404, "Not Found");
-                return;
             }
 
-            // Заголовок с public
-            Path filePath = Path.of(PUBLIC_DIR, path);
-            String mimeType = Files.probeContentType(filePath);
-
-            if (path.equals("/classic.html")) {
-                String template = Files.readString(filePath);
-                String content = template.replace("{time}", LocalDateTime.now().toString());
-                byte[] contentBytes = content.getBytes();
-                sendResponse(out, 200, "OK", mimeType, contentBytes.length, contentBytes);
-                return;
-            }
-
-            long length = Files.size(filePath);
-            sendResponseHeader(out, 200, "OK", mimeType, length);
-            Files.copy(filePath, out);
-
-        } catch (IOException e) {
-            // Логирование можно расширить, но для учебного проекта — тихо игнорируем
+        } catch (Exception e) {
+            // Можно логировать, но для учебного — игнорируем
         }
+    }
+
+    private Request parseRequest(BufferedInputStream input) throws IOException {
+        input.mark(4096);
+
+        String requestLine = readLine(input);
+        String[] parts = requestLine.split(" ", 3);
+        if (parts.length < 3) {
+            throw new IOException("Invalid request line");
+        }
+
+        String method = parts[0];
+        String path = parts[1].split("\\?")[0]; // убираем query string
+
+        Map<String, String> headers = new HashMap<>();
+        String line;
+        while (!(line = readLine(input)).isEmpty()) {
+            String[] headerParts = line.split(": ", 2);
+            if (headerParts.length == 2) {
+                headers.put(headerParts[0], headerParts[1]);
+            }
+        }
+
+        return new Request(method, path, headers, input);
+    }
+
+    private String readLine(BufferedInputStream input) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        int b;
+        while ((b = input.read()) != -1) {
+            if (b == '\r') {
+                input.read(); // skip '\n'
+                break;
+            }
+            buffer.write(b);
+        }
+        return buffer.toString(StandardCharsets.UTF_8);
+    }
+
+    private Handler findHandler(String method, String path) {
+        Map<String, Handler> methodHandlers = handlers.get(method);
+        if (methodHandlers == null) return null;
+        return methodHandlers.get(path);
     }
 
     private void sendErrorResponse(BufferedOutputStream out, int code, String message) {
-        String statusLine = String.format("HTTP/1.1 %d %s\r\n", code, message);
-        String response = statusLine +
-                "Content-Length: 0\r\n" +
-                "Connection: close\r\n" +
-                "\r\n";
+        String response = String.format(
+                "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                code, message
+        );
         try {
-            out.write(response.getBytes());
+            out.write(response.getBytes(StandardCharsets.UTF_8));
             out.flush();
-        } catch (IOException ignored) {
-        }
-    }
-
-    private void sendResponse(BufferedOutputStream out, int code, String message, String mimeType, int contentLength, byte[] content) {
-        String statusLine = String.format("HTTP/1.1 %d %s\r\n", code, message);
-        String headers = statusLine +
-                "Content-Type: " + (mimeType != null ? mimeType : "application/octet-stream") + "\r\n" +
-                "Content-Length: " + contentLength + "\r\n" +
-                "Connection: close\r\n" +
-                "\r\n";
-        try {
-            out.write(headers.getBytes());
-            out.write(content);
-            out.flush();
-        } catch (IOException ignored) {
-        }
-    }
-
-    private void sendResponseHeader(BufferedOutputStream out, int code, String message, String mimeType, long contentLength) {
-        String statusLine = String.format("HTTP/1.1 %d %s\r\n", code, message);
-        String headers = statusLine +
-                "Content-Type: " + (mimeType != null ? mimeType : "application/octet-stream") + "\r\n" +
-                "Content-Length: " + contentLength + "\r\n" +
-                "Connection: close\r\n" +
-                "\r\n";
-        try {
-            out.write(headers.getBytes());
-            out.flush();
-        } catch (IOException ignored) {
-        }
+        } catch (IOException ignored) {}
     }
 }
