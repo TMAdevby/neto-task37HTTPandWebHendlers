@@ -1,4 +1,4 @@
-package RefactoringMultiThreading;
+package Heandlers;
 
 import java.io.*;
 import java.net.ServerSocket;
@@ -50,7 +50,7 @@ public class Server {
             }
 
         } catch (Exception e) {
-            // Можно логировать, но для учебного — игнорируем
+            e.printStackTrace();
         }
     }
 
@@ -64,7 +64,7 @@ public class Server {
         }
 
         String method = parts[0];
-        String path = parts[1].split("\\?")[0]; // убираем query string
+        String path = parts[1].split("\\?")[0];
 
         Map<String, String> headers = new HashMap<>();
         String line;
